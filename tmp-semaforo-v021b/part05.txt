@@ -1,0 +1,156 @@
+ccountInfoDouble(ACCOUNT_EQUITY);
+   if(eq>g_peak_equity)
+     {
+      g_peak_equity=eq;
+      GlobalVariableSet(g_peak_key,g_peak_equity);
+     }
+   if(g_peak_equity<=0) return;
+   double dd=(g_peak_equity-eq)/g_peak_equity*100.0;
+   if(dd>=InpMaxDrawdownPct)
+     {
+      g_day_blocked=true; g_killed=true;
+      GlobalVariableSet(g_kill_key,1.0);
+      ulong kill_ticket=0; if(FindOurPosition(kill_ticket)) trade.PositionClose(kill_ticket);
+      Notify(StringFormat("SEMAFORO KILL: drawdown %.2f%% >= %.2f%%. Requiere revision humana.",dd,InpMaxDrawdownPct));
+     }
+  }
+
+bool RiskAllowsEntry()
+  {
+   if(g_killed) return false;
+   if(g_day_blocked) return false;
+   if(TradesToday()>=InpMaxTradesPerDay) return false;
+   if(HasOurPosition()) return false;
+   datetime day_start=NYToUTC(NYAt(g_trading_date,18,0)-86400);
+   datetime week_start=NYToUTC(TradingWeekStartNY(g_trading_date));
+   double balance=AccountInfoDouble(ACCOUNT_BALANCE);
+   if(balance<=0) return false;
+   double daypl=RealizedPL(day_start,CurrentUTC()+60);
+   double weekpl=RealizedPL(week_start,CurrentUTC()+60);
+   if(daypl<=-(InpDailyLossPct/100.0)*balance) return false;
+   if(weekpl<=-(InpWeeklyLossPct/100.0)*balance) return false;
+   return true;
+  }
+
+//------------------------ preparacion del dia -----------------------
+void ResetAttempts()
+  {
+   g_level_count=0;
+   for(int i=0;i<2;i++)
+     {
+      g_levels[i].enabled=false; g_levels[i].active=false; g_levels[i].consumed=false;
+      g_levels[i].bars_seen=0; g_levels[i].level=0; g_levels[i].extreme=0;
+     }
+  }
+
+void AddLevel(double level)
+  {
+   if(g_level_count>=2) return;
+   g_levels[g_level_count].enabled=true;
+   g_levels[g_level_count].level=level;
+   g_level_count++;
+  }
+
+bool PrepareDay(datetime trading_date)
+  {
+   g_prepared=false; g_day_blocked=false; g_color=COLOR_AMBER; ResetAttempts();
+   g_trading_date=trading_date;
+
+   double asia_lo=0,asia_hi=0;
+   if(!GetAsianRange(trading_date,asia_lo,asia_hi))
+     {
+      Print("Asia incompleta/hueco >5 min: AMBAR");
+      return false;
+     }
+   RangeBar prev={};
+   datetime prev_date=trading_date-86400;
+   while(!IsWeekday(prev_date)) prev_date-=86400;
+   if(!GetTradingDayBar(g_gold,prev_date,prev)) return false;
+   if(!CalcDailyATR(trading_date,g_atr_daily)) return false;
+
+   int trend=0;
+   if(!CalcGoldTrend(trading_date,trend)) return false;
+   bool dxy_favor=false,tips_favor=false; double dxy_last=0,dxy_ma=0,tips_last=0,tips_ma=0;
+   if(!CalcDXYState(trading_date,dxy_favor,dxy_last,dxy_ma)) return false;
+   if(!FetchTips(tips_favor,tips_last,tips_ma)) return false;
+   g_calendar_ok=DetectCalendarDay(trading_date,g_data_day,g_fed_day);
+   if(!g_calendar_ok) return false;
+
+   if(g_fed_day)
+      g_color=COLOR_AMBER;
+   else if(trend>0 && !((!dxy_favor) && (!tips_favor)))
+      g_color=COLOR_GREEN;
+   else if(trend<0 && !(dxy_favor && tips_favor))
+      g_color=COLOR_RED;
+   else
+      g_color=COLOR_AMBER;
+
+   if(g_color==COLOR_GREEN)
+     {
+      double l1=asia_lo;
+      bool prev_allowed=(asia_lo>=prev.low); // si Asia ya perforo minimo ayer, no cuenta
+      if(prev_allowed)
+        {
+         double l2=prev.low;
+         if(MathAbs(l1-l2)<InpMergeLevelsATR*g_atr_daily) AddLevel(MathMin(l1,l2));
+         else { AddLevel(l1); AddLevel(l2); }
+        }
+      else AddLevel(l1);
+     }
+   else if(g_color==COLOR_RED)
+     {
+      double l1=asia_hi;
+      bool prev_allowed=(asia_hi<=prev.high);
+      if(prev_allowed)
+        {
+         double l2=prev.high;
+         if(MathAbs(l1-l2)<InpMergeLevelsATR*g_atr_daily) AddLevel(MathMax(l1,l2));
+         else { AddLevel(l1); AddLevel(l2); }
+        }
+      else AddLevel(l1);
+     }
+
+   g_prepared=true;
+   g_last_processed_bar_ny=NYAt(trading_date,2,0)-15*60;
+   PrintFormat("SEMAFORO preparado %s | color=%s ATRd=%.3f DXY %.3f/%.3f TIPS %.3f/%.3f data=%s fed=%s niveles=%d",
+               TimeToString(trading_date,TIME_DATE),ColorText(g_color),g_atr_daily,dxy_last,dxy_ma,tips_last,tips_ma,
+               g_data_day?"SI":"NO",g_fed_day?"SI":"NO",g_level_count);
+   Notify(StringFormat("Semaforo %s: %s. ATRd %.2f. Niveles %d. %s",
+         TimeToString(trading_date,TIME_DATE),ColorText(g_color),g_atr_daily,g_level_count,
+         InpExecuteDemoOrders?"DEMO auto":"solo senales"));
+   return true;
+  }
+
+//--------------------- barras 15m / detector ------------------------
+bool Build15Bar(datetime start_ny,RangeBar &b)
+  {
+   return BuildMidBar(g_gold,NYToUTC(start_ny),NYToUTC(start_ny+15*60),b,true);
+  }
+
+void ExecuteSignal(int level_index,double sweep_extreme,datetime signal_bar_ny)
+  {
+   if(g_color==COLOR_AMBER) return;
+   datetime now_ny=UTCToNY(CurrentUTC());
+   datetime entry_start=NYAt(g_trading_date,2,0), entry_end=NYAt(g_trading_date,11,0);
+   if(now_ny<entry_start || now_ny>=entry_end) return;
+   if(g_data_day && now_ny>=NYAt(g_trading_date,8,0) && now_ny<NYAt(g_trading_date,9,0)) return;
+   if(!RiskAllowsEntry()) return;
+
+   MqlTick tick={}; if(!SymbolInfoTick(g_gold,tick)) return;
+   datetime current_slot=Floor15(now_ny);
+   double normal=0;
+   if(!NormalSpread(current_slot,normal)) return;
+   double spread=tick.ask-tick.bid;
+   if(spread>2.0*normal) return;
+
+   if(!CalcATR15(signal_bar_ny+15*60,g_atr15_last)) return;
+   double sl=0,entry=0,tp=0;
+   if(g_color==COLOR_GREEN)
+     {
+      entry=tick.ask;
+      sl=sweep_extreme-InpStopPadATR15*g_atr15_last;
+      if(entry-sl<=0 || entry-sl>InpMaxStopATR*g_atr_daily) return;
+      tp=entry+InpTargetR*(entry-sl);
+     }
+   else
+     
