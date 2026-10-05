@@ -1,0 +1,194 @@
+etime Floor15(datetime ny)
+  {
+   MqlDateTime x={}; TimeToStruct(ny,x);
+   x.min=(x.min/15)*15; x.sec=0;
+   return StructToTime(x);
+  }
+
+bool IsWeekday(datetime d)
+  {
+   MqlDateTime x={}; TimeToStruct(d,x);
+   return (x.day_of_week>=1 && x.day_of_week<=5);
+  }
+
+//---------------------- resolucion de simbolos ----------------------
+string ResolveBrokerSymbol(string requested)
+  {
+   if(requested=="") return "";
+   if(SymbolSelect(requested,true)) return requested;
+   string req=requested; StringToLower(req);
+   int total=SymbolsTotal(false);
+   for(int i=0;i<total;i++)
+     {
+      string s=SymbolName(i,false);
+      string ls=s; StringToLower(ls);
+      if(StringFind(ls,req)>=0)
+        {
+         if(SymbolSelect(s,true))
+           {
+            PrintFormat("Simbolo %s resuelto automaticamente como %s",requested,s);
+            return s;
+           }
+        }
+     }
+   PrintFormat("No se encontro simbolo equivalente a %s",requested);
+   return requested;
+  }
+
+//----------------------------- logging ------------------------------
+string ColorText(SignalColor c)
+  {
+   if(c==COLOR_GREEN) return "VERDE";
+   if(c==COLOR_RED) return "ROJO";
+   return "AMBAR";
+  }
+
+void Notify(string msg)
+  {
+   Print(msg);
+   if(InpPushNotifications && TerminalInfoInteger(TERMINAL_NOTIFICATIONS_ENABLED))
+      SendNotification(msg);
+  }
+
+//------------------------- datos por ticks --------------------------
+bool GetTicksRange(string symbol,datetime from_utc,datetime to_utc,MqlTick &ticks[])
+  {
+   ArrayFree(ticks);
+   if(to_utc<=from_utc) return false;
+   ulong a=(ulong)from_utc*1000;
+   ulong b=(ulong)to_utc*1000;
+   ResetLastError();
+   int n=CopyTicksRange(symbol,ticks,COPY_TICKS_INFO,a,b);
+   if(n<=0)
+     {
+      PrintFormat("Sin ticks %s %s -> %s, err=%d",symbol,TimeToString(from_utc),TimeToString(to_utc),GetLastError());
+      return false;
+     }
+   return true;
+  }
+
+bool BuildMidBar(string symbol,datetime from_utc,datetime to_utc,RangeBar &bar,bool check_gap=false)
+  {
+   bar.valid=false;
+   MqlTick ticks[];
+   if(!GetTicksRange(symbol,from_utc,to_utc,ticks)) return false;
+   bool first=true;
+   datetime prev=0;
+   datetime first_time=0,last_time=0;
+   for(int i=0;i<ArraySize(ticks);i++)
+     {
+      if(ticks[i].bid<=0 || ticks[i].ask<=0) continue;
+      if(first_time==0) first_time=ticks[i].time;
+      if(check_gap && prev>0 && (ticks[i].time-prev)>300) return false;
+      prev=ticks[i].time; last_time=ticks[i].time;
+      double mid=(ticks[i].bid+ticks[i].ask)/2.0;
+      if(first)
+        {
+         bar.open=bar.high=bar.low=bar.close=mid;
+         first=false;
+        }
+      else
+        {
+         if(mid>bar.high) bar.high=mid;
+         if(mid<bar.low)  bar.low=mid;
+         bar.close=mid;
+        }
+     }
+   if(check_gap && !first)
+     {
+      if((first_time-from_utc)>300) return false;
+      if((to_utc-last_time)>300) return false;
+     }
+   bar.valid=!first;
+   return bar.valid;
+  }
+
+bool GetLastMidBefore(string symbol,datetime end_utc,double &mid)
+  {
+   MqlTick ticks[];
+   if(!GetTicksRange(symbol,end_utc-300,end_utc,ticks)) return false;
+   for(int i=ArraySize(ticks)-1;i>=0;i--)
+     {
+      if(ticks[i].bid>0 && ticks[i].ask>0 && ticks[i].time<=end_utc)
+        {
+         mid=(ticks[i].bid+ticks[i].ask)/2.0;
+         return true;
+        }
+     }
+   return false;
+  }
+
+bool GetTradingClose(string symbol,datetime trading_date,double &close)
+  {
+   datetime end_utc=NYToUTC(NYAt(trading_date,17,0));
+   return GetLastMidBefore(symbol,end_utc,close);
+  }
+
+bool GetTradingDayBar(string symbol,datetime trading_date,RangeBar &bar)
+  {
+   datetime a,b; TradingBoundsUTC(trading_date,a,b);
+   return BuildMidBar(symbol,a,b,bar,false);
+  }
+
+bool GetAsianRange(datetime trading_date,double &lo,double &hi)
+  {
+   datetime from_ny=NYAt(trading_date,18,0)-86400;
+   datetime to_ny=NYAt(trading_date,2,0);
+   RangeBar b={};
+   if(!BuildMidBar(g_gold,NYToUTC(from_ny),NYToUTC(to_ny),b,true)) return false;
+   lo=b.low; hi=b.high;
+   return true;
+  }
+
+//----------------------------- ATR ----------------------------------
+bool GetRecentDailyBars(datetime before_date,int needed,RangeBar &out[])
+  {
+   ArrayFree(out);
+   datetime d=before_date;
+   int attempts=0;
+   while(ArraySize(out)<needed && attempts<needed*4)
+     {
+      attempts++;
+      if(IsWeekday(d))
+        {
+         RangeBar b={};
+         if(GetTradingDayBar(g_gold,d,b))
+           {
+            int n=ArraySize(out); ArrayResize(out,n+1); out[n]=b; // newest first
+           }
+        }
+      d-=86400;
+     }
+   return ArraySize(out)>=needed;
+  }
+
+bool CalcDailyATR(datetime trading_date,double &atr)
+  {
+   // 35 dias permite que el Wilder se estabilice mucho mejor que un simple ATR14.
+   RangeBar b[];
+   if(!GetRecentDailyBars(trading_date-86400,35,b)) return false;
+   int n=ArraySize(b);
+   // convertir a cronologico
+   double tr[]; ArrayResize(tr,n-1);
+   int k=0;
+   for(int i=n-2;i>=0;i--)
+     {
+      // b[i] es mas nuevo que b[i+1]
+      double prev_close=b[i+1].close;
+      double a=b[i].high-b[i].low;
+      double c=MathAbs(b[i].high-prev_close);
+      double d=MathAbs(b[i].low-prev_close);
+      tr[k++]=MathMax(a,MathMax(c,d));
+     }
+   if(k<InpATRDays) return false;
+   double x=0;
+   for(int i=0;i<InpATRDays;i++) x+=tr[i];
+   x/=InpATRDays;
+   for(int i=InpATRDays;i<k;i++) x=((x*(InpATRDays-1))+tr[i])/InpATRDays;
+   atr=x;
+   return atr>0;
+  }
+
+bool CalcATR15(datetime bar_end_ny,double &atr)
+  {
+   // 30 barras historicas de 15m, reconstruidas con m
