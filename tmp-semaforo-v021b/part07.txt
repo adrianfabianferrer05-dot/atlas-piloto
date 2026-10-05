@@ -1,0 +1,119 @@
+ionClose(pos_ticket);
+      Notify("Semaforo: cierre obligatorio 15:00 NY.");
+     }
+  }
+
+void DetectTickGap(datetime now_utc,datetime now_ny)
+  {
+   if(g_last_tick_utc>0 && (now_utc-g_last_tick_utc)>300)
+     {
+      datetime a=NYAt(g_trading_date,2,0), b=NYAt(g_trading_date,11,0);
+      if(now_ny>=a && now_ny<b)
+        {
+         g_day_blocked=true;
+         Print("Hueco >5 min detectado en ventana operativa: entradas canceladas.");
+        }
+     }
+   g_last_tick_utc=now_utc;
+  }
+
+//----------------------------- eventos ------------------------------
+int OnInit()
+  {
+   g_gold=(InpGoldSymbol=="" ? _Symbol : InpGoldSymbol);
+   if((ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(ACCOUNT_TRADE_MODE)==ACCOUNT_TRADE_MODE_REAL)
+     {
+      Print("Semaforo v0.2.1: esta version es DEMO ONLY. Cuenta REAL rechazada.");
+      return INIT_FAILED;
+     }
+   SymbolSelect(g_gold,true);
+   g_eurusd=ResolveBrokerSymbol(InpEURUSD);
+   g_usdjpy=ResolveBrokerSymbol(InpUSDJPY);
+   g_gbpusd=ResolveBrokerSymbol(InpGBPUSD);
+   g_usdcad=ResolveBrokerSymbol(InpUSDCAD);
+   g_usdsek=ResolveBrokerSymbol(InpUSDSEK);
+   g_usdchf=ResolveBrokerSymbol(InpUSDCHF);
+   string syms[6]={g_eurusd,g_usdjpy,g_gbpusd,g_usdcad,g_usdsek,g_usdchf};
+   for(int i=0;i<6;i++)
+     {
+      if(!SymbolSelect(syms[i],true))
+        {
+         PrintFormat("Falta simbolo requerido para DXY: %s. Fail-closed.",syms[i]);
+         return INIT_FAILED;
+        }
+     }
+   trade.SetExpertMagicNumber(InpMagic);
+   trade.SetDeviationInPoints(InpDeviationPoints);
+
+   long login=AccountInfoInteger(ACCOUNT_LOGIN);
+   g_peak_key=StringFormat("SEMAFORO_PEAK_%I64d_%I64u",login,InpMagic);
+   g_kill_key=StringFormat("SEMAFORO_KILL_%I64d_%I64u",login,InpMagic);
+   if(InpHumanResetKill && GlobalVariableCheck(g_kill_key)) GlobalVariableDel(g_kill_key);
+   g_killed=(GlobalVariableCheck(g_kill_key) && GlobalVariableGet(g_kill_key)>0.5);
+   if(GlobalVariableCheck(g_peak_key)) g_peak_equity=GlobalVariableGet(g_peak_key);
+   else { g_peak_equity=AccountInfoDouble(ACCOUNT_EQUITY); GlobalVariableSet(g_peak_key,g_peak_equity); }
+   if(InpHumanResetKill)
+     {
+      g_peak_equity=AccountInfoDouble(ACCOUNT_EQUITY);
+      GlobalVariableSet(g_peak_key,g_peak_equity);
+      Print("Kill switch rearmado por input humano. Devuelve InpHumanResetKill=false tras esta carga.");
+     }
+   if(g_killed) Print("KILL SWITCH ACTIVO: no se permitiran entradas hasta revision humana.");
+
+   EventSetTimer(5);
+   Print("Semaforo MT5 iniciado. DEMO only. Si usas FRED añade https://fred.stlouisfed.org en Herramientas > Opciones > Asesores Expertos > WebRequest.");
+   return INIT_SUCCEEDED;
+  }
+
+void OnDeinit(const int reason)
+  {
+   EventKillTimer();
+  }
+
+void MainLoop()
+  {
+   datetime now_utc=CurrentUTC();
+   datetime now_ny=UTCToNY(now_utc);
+   datetime td=TradingDateFromNY(now_ny);
+   DetectTickGap(now_utc,now_ny);
+   UpdatePeakAndKillIfNeeded();
+
+   if(td!=g_trading_date)
+     {
+      g_trading_date=td; g_prepared=false; g_day_blocked=false; ResetAttempts();
+     }
+
+   // Solo preparar una vez pasada las 02:00 NY.
+   if(!g_prepared && now_ny>=NYAt(td,2,0) && now_ny<NYAt(td,17,0))
+     {
+      if(PrepareDay(td))
+        {
+         // reconstruye lo ocurrido desde las 02:00; no persigue senales antiguas.
+         ReconstructAndProcess(now_ny,false);
+        }
+      else
+        {
+         // v0.2.1: si faltan datos al preparar el dia, ese dia queda AMBAR.
+         g_color=COLOR_AMBER;
+         g_day_blocked=true;
+         g_prepared=true;
+         Notify("Semaforo: datos insuficientes/no verificables. Dia bloqueado en AMBAR (fail-closed).");
+        }
+     }
+   else if(g_prepared)
+     {
+      ManageTimeExit(now_ny);
+      ReconstructAndProcess(now_ny,true);
+     }
+  }
+
+void OnTick()
+  {
+   MainLoop();
+  }
+
+void OnTimer()
+  {
+   MainLoop();
+  }
+//+------------------------------------------------------------------+
