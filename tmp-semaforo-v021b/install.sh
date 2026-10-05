@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 BASE="https://raw.githubusercontent.com/adrianfabianferrer05-dot/atlas-piloto/main/tmp-semaforo-v021b"
-EXPECTED_SHA="d22a0dec1547605e0dc11ee1956f92d7e16c4c3b4c29bceef5902bc2b3374637"
+EXPECTED_SHA="a9a0ac702e5c3963974090375398f074b4d27a8344181672db7d87a96597ac77"
 
 CID="$(docker ps --format '{{.ID}} {{.Image}}' | awk '$2 ~ /^gmag11\/metatrader5_vnc/ {print $1; exit}')"
 if [ -z "$CID" ]; then
