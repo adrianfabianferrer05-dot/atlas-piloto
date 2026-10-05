@@ -1,0 +1,164 @@
+ StringFind(s,Lower(b))>=0) return true;
+   if(c!="" && StringFind(s,Lower(c))>=0) return true;
+   if(d!="" && StringFind(s,Lower(d))>=0) return true;
+   return false;
+  }
+
+bool DetectCalendarDay(datetime trading_date,bool &data_day,bool &fed_day)
+  {
+   data_day=false; fed_day=false;
+   if(InpDataDayOverride!=AUTO_DETECT) data_day=(InpDataDayOverride==FORCE_YES);
+   if(InpFedDayOverride!=AUTO_DETECT) fed_day=(InpFedDayOverride==FORCE_YES);
+   if(InpDataDayOverride!=AUTO_DETECT && InpFedDayOverride!=AUTO_DETECT) return true;
+
+   // Calendario trabaja en hora del servidor. Convertimos el dia NY a UTC y aplicamos offset actual del servidor.
+   datetime ny0=NYAt(trading_date,0,0);
+   datetime ny1=ny0+86400;
+   datetime utc0=NYToUTC(ny0), utc1=NYToUTC(ny1);
+   int server_offset=(int)(TimeTradeServer()-TimeGMT());
+   datetime s0=utc0+server_offset, s1=utc1+server_offset;
+   MqlCalendarValue vals[];
+   ResetLastError();
+   int n=CalendarValueHistory(vals,s0,s1,"US","USD");
+   if(n<0)
+     {
+      PrintFormat("Calendario MT5 no disponible err=%d",GetLastError());
+      return false;
+     }
+   for(int i=0;i<n;i++)
+     {
+      MqlCalendarEvent ev={};
+      if(!CalendarEventById(vals[i].event_id,ev)) continue;
+      string key=Lower(ev.event_code+" "+ev.name);
+      bool is_cpi=(StringFind(key,"consumer price")>=0 || StringFind(key,"cpi")>=0 || StringFind(key,"indice de precios al consumidor")>=0);
+      bool is_pce=(StringFind(key,"personal consumption")>=0 || StringFind(key,"pce")>=0 || StringFind(key,"gasto de consumo personal")>=0);
+      bool is_nfp=(StringFind(key,"nonfarm")>=0 || StringFind(key,"non-farm")>=0 || StringFind(key,"employment situation")>=0 || StringFind(key,"nominas no agricolas")>=0);
+      bool is_fomc=(StringFind(key,"fomc")>=0 || StringFind(key,"federal reserve interest rate")>=0 || StringFind(key,"fed interest rate")>=0 || StringFind(key,"decision de tipos")>=0);
+      if(InpDataDayOverride==AUTO_DETECT && (is_cpi || is_pce || is_nfp)) data_day=true;
+      if(InpFedDayOverride==AUTO_DETECT && is_fomc) fed_day=true;
+     }
+   return true;
+  }
+
+//-------------------------- spread normal ---------------------------
+void SortDoubles(double &a[])
+  {
+   ArraySort(a);
+  }
+
+double Median(double &a[])
+  {
+   int n=ArraySize(a); if(n==0) return 0;
+   SortDoubles(a);
+   if((n%2)==1) return a[n/2];
+   return (a[n/2-1]+a[n/2])/2.0;
+  }
+
+bool NormalSpread(datetime slot_ny,double &normal)
+  {
+   MqlDateTime s={}; TimeToStruct(slot_ny,s);
+   double all[]; ArrayResize(all,0);
+   datetime d=DateOnly(slot_ny)-86400;
+   int days=0, tries=0;
+   while(days<20 && tries<80)
+     {
+      tries++;
+      if(IsWeekday(d))
+        {
+         MqlDateTime dd={}; TimeToStruct(d,dd);
+         datetime a_ny=MakeDT(dd.year,dd.mon,dd.day,s.hour,s.min,0);
+         MqlTick ticks[];
+         if(GetTicksRange(g_gold,NYToUTC(a_ny),NYToUTC(a_ny+15*60),ticks))
+           {
+            for(int i=0;i<ArraySize(ticks);i++)
+              {
+               if(ticks[i].bid>0 && ticks[i].ask>0)
+                 {
+                  int n=ArraySize(all); ArrayResize(all,n+1); all[n]=ticks[i].ask-ticks[i].bid;
+                 }
+              }
+            days++;
+           }
+        }
+      d-=86400;
+     }
+   if(days<20 || ArraySize(all)==0) return false;
+   normal=Median(all);
+   return normal>0;
+  }
+
+//--------------------------- risk kernel ----------------------------
+datetime UTCToServer(datetime utc)
+  {
+   return utc+(datetime)(TimeTradeServer()-TimeGMT());
+  }
+
+datetime TradingWeekStartNY(datetime trading_date)
+  {
+   MqlDateTime x={}; TimeToStruct(trading_date,x);
+   int back=x.day_of_week-1; if(back<0) back+=7;
+   datetime monday=DateOnly(trading_date)-back*86400;
+   return monday-6*3600; // domingo 18:00 NY
+  }
+
+double RealizedPL(datetime from_utc,datetime to_utc)
+  {
+   if(!HistorySelect(UTCToServer(from_utc),UTCToServer(to_utc))) return 0.0;
+   double sum=0;
+   int n=HistoryDealsTotal();
+   for(int i=0;i<n;i++)
+     {
+      ulong ticket=HistoryDealGetTicket(i);
+      if(ticket==0) continue;
+      if((ulong)HistoryDealGetInteger(ticket,DEAL_MAGIC)!=InpMagic) continue;
+      if(HistoryDealGetString(ticket,DEAL_SYMBOL)!=g_gold) continue;
+      sum+=HistoryDealGetDouble(ticket,DEAL_PROFIT);
+      sum+=HistoryDealGetDouble(ticket,DEAL_COMMISSION);
+      sum+=HistoryDealGetDouble(ticket,DEAL_SWAP);
+     }
+   return sum;
+  }
+
+int TradesToday()
+  {
+   datetime from=NYToUTC(NYAt(g_trading_date,18,0)-86400);
+   datetime to=CurrentUTC()+60;
+   if(!HistorySelect(UTCToServer(from),UTCToServer(to))) return 0;
+   int n=HistoryDealsTotal(), count=0;
+   for(int i=0;i<n;i++)
+     {
+      ulong t=HistoryDealGetTicket(i); if(t==0) continue;
+      if((ulong)HistoryDealGetInteger(t,DEAL_MAGIC)!=InpMagic) continue;
+      if(HistoryDealGetString(t,DEAL_SYMBOL)!=g_gold) continue;
+      ENUM_DEAL_ENTRY e=(ENUM_DEAL_ENTRY)HistoryDealGetInteger(t,DEAL_ENTRY);
+      if(e==DEAL_ENTRY_IN) count++;
+     }
+   return count;
+  }
+
+bool FindOurPosition(ulong &ticket)
+  {
+   ticket=0;
+   int n=PositionsTotal();
+   for(int i=0;i<n;i++)
+     {
+      ulong t=PositionGetTicket(i);
+      if(t==0) continue;
+      if(PositionGetString(POSITION_SYMBOL)!=g_gold) continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+      ticket=t;
+      return true;
+     }
+   return false;
+  }
+
+bool HasOurPosition()
+  {
+   ulong ticket=0;
+   return FindOurPosition(ticket);
+  }
+
+void UpdatePeakAndKillIfNeeded()
+  {
+   if(g_killed) return;
+   double eq=A
