@@ -1,0 +1,181 @@
+idpoint de ticks.
+   int need=30;
+   RangeBar bars[]; ArrayResize(bars,need);
+   int got=0;
+   datetime cursor=bar_end_ny;
+   int tries=0;
+   while(got<need && tries<need+16)
+     {
+      tries++;
+      datetime a=cursor-15*60;
+      RangeBar b={};
+      if(BuildMidBar(g_gold,NYToUTC(a),NYToUTC(cursor),b,false)) bars[got++]=b;
+      cursor=a;
+     }
+   if(got<InpATRDays+1) return false;
+   // bars newest first; TR cronologico
+   double trs[]; ArrayResize(trs,got-1);
+   int k=0;
+   for(int i=got-2;i>=0;i--)
+     {
+      double prev=bars[i+1].close;
+      double a=bars[i].high-bars[i].low;
+      double c=MathAbs(bars[i].high-prev);
+      double d=MathAbs(bars[i].low-prev);
+      trs[k++]=MathMax(a,MathMax(c,d));
+     }
+   double x=0;
+   for(int i=0;i<InpATRDays;i++) x+=trs[i];
+   x/=InpATRDays;
+   for(int i=InpATRDays;i<k;i++) x=((x*(InpATRDays-1))+trs[i])/InpATRDays;
+   atr=x;
+   return atr>0;
+  }
+
+//--------------------------- tendencia oro --------------------------
+bool CalcGoldTrend(datetime trading_date,int &trend)
+  {
+   int need=InpTrendMA+InpTrendSlopeDays;
+   double closes[]; ArrayResize(closes,need);
+   int got=0; int tries=0;
+   datetime d=trading_date-86400;
+   while(got<need && tries<need*3)
+     {
+      tries++;
+      if(IsWeekday(d))
+        {
+         double c=0;
+         if(GetTradingClose(g_gold,d,c)) closes[got++]=c;
+        }
+      d-=86400;
+     }
+   if(got<need) return false;
+   double ma_now=0, ma_old=0;
+   for(int i=0;i<InpTrendMA;i++) ma_now+=closes[i];
+   for(int i=InpTrendSlopeDays;i<InpTrendSlopeDays+InpTrendMA;i++) ma_old+=closes[i];
+   ma_now/=InpTrendMA; ma_old/=InpTrendMA;
+   if(closes[0]>ma_now && ma_now>ma_old) trend=1;
+   else if(closes[0]<ma_now && ma_now<ma_old) trend=-1;
+   else trend=0;
+   return true;
+  }
+
+//------------------------------- DXY --------------------------------
+bool CalcDXYForDate(datetime d,double &dxy)
+  {
+   double eur,jpy,gbp,cad,sek,chf;
+   if(!GetTradingClose(g_eurusd,d,eur)) return false;
+   if(!GetTradingClose(g_usdjpy,d,jpy)) return false;
+   if(!GetTradingClose(g_gbpusd,d,gbp)) return false;
+   if(!GetTradingClose(g_usdcad,d,cad)) return false;
+   if(!GetTradingClose(g_usdsek,d,sek)) return false;
+   if(!GetTradingClose(g_usdchf,d,chf)) return false;
+   if(eur<=0 || jpy<=0 || gbp<=0 || cad<=0 || sek<=0 || chf<=0) return false;
+   dxy=50.14348112*MathPow(eur,-0.576)*MathPow(jpy,0.136)*MathPow(gbp,-0.119)*MathPow(cad,0.091)*MathPow(sek,0.042)*MathPow(chf,0.036);
+   return (dxy>0);
+  }
+
+bool CalcDXYState(datetime trading_date,bool &favors_gold,double &last,double &ma20)
+  {
+   double vals[]; ArrayResize(vals,InpMacroMA);
+   int got=0; int tries=0;
+   datetime d=trading_date-86400;
+   while(got<InpMacroMA && tries<InpMacroMA*4)
+     {
+      tries++;
+      if(IsWeekday(d))
+        {
+         double v=0;
+         if(CalcDXYForDate(d,v)) vals[got++]=v;
+        }
+      d-=86400;
+     }
+   if(got<InpMacroMA) return false;
+   last=vals[0]; ma20=0;
+   for(int i=0;i<InpMacroMA;i++) ma20+=vals[i];
+   ma20/=InpMacroMA;
+   favors_gold=(last<ma20); // empate = en contra
+   return true;
+  }
+
+//------------------------------- TIPS --------------------------------
+datetime ParseISODate(string s)
+  {
+   if(StringLen(s)<10) return 0;
+   int y=(int)StringToInteger(StringSubstr(s,0,4));
+   int m=(int)StringToInteger(StringSubstr(s,5,2));
+   int d=(int)StringToInteger(StringSubstr(s,8,2));
+   if(y<2000 || m<1 || m>12 || d<1 || d>31) return 0;
+   return MakeDT(y,m,d,0,0,0);
+  }
+
+datetime SubBusinessDays(datetime d,int n)
+  {
+   datetime x=d;
+   int done=0;
+   while(done<n)
+     {
+      x-=86400;
+      if(IsWeekday(x)) done++;
+     }
+   return x;
+  }
+
+bool FetchTips(bool &favors_gold,double &last,double &ma20)
+  {
+   if(InpUseManualTips)
+     {
+      last=InpManualTipsCurrent; ma20=InpManualTipsMA20;
+      if(ma20==0.0 && last==0.0) return false;
+      favors_gold=(last<ma20);
+      return true;
+     }
+   if(!InpUseFRED) return false;
+   char data[]; ArrayResize(data,0);
+   char result[]; string headers="";
+   ResetLastError();
+   int code=WebRequest("GET",InpFredUrl,"",5000,data,result,headers);
+   if(code!=200)
+     {
+      PrintFormat("FRED WebRequest fallo HTTP=%d err=%d. Añade https://fred.stlouisfed.org a URLs permitidas.",code,GetLastError());
+      return false;
+     }
+   string csv=CharArrayToString(result);
+   string lines[];
+   ushort nl=StringGetCharacter("
+",0);
+   int n=StringSplit(csv,nl,lines);
+   if(n<25) return false;
+   datetime cutoff=SubBusinessDays(g_trading_date,2);
+   double vals[]; ArrayResize(vals,0);
+   for(int i=1;i<n;i++)
+     {
+      string line=lines[i]; StringReplace(line,"","");
+      string cols[]; ushort comma=StringGetCharacter(",",0);
+      if(StringSplit(line,comma,cols)<2) continue;
+      datetime d=ParseISODate(cols[0]);
+      if(d<=0 || d>cutoff || cols[1]=="." || StringLen(cols[1])==0) continue;
+      double v=StringToDouble(cols[1]);
+      int s=ArraySize(vals); ArrayResize(vals,s+1); vals[s]=v;
+     }
+   if(ArraySize(vals)<InpMacroMA) return false;
+   int sz=ArraySize(vals);
+   last=vals[sz-1]; ma20=0;
+   for(int i=sz-InpMacroMA;i<sz;i++) ma20+=vals[i];
+   ma20/=InpMacroMA;
+   favors_gold=(last<ma20);
+   return true;
+  }
+
+//------------------------- calendario economico ---------------------
+string Lower(string s)
+  {
+   StringToLower(s);
+   return s;
+  }
+
+bool ContainsAny(string s,string a,string b="",string c="",string d="")
+  {
+   s=Lower(s);
+   if(a!="" && StringFind(s,Lower(a))>=0) return true;
+   if(b!="" &&
