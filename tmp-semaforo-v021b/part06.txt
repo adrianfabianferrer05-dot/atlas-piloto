@@ -1,0 +1,155 @@
+ {
+      entry=tick.bid;
+      sl=sweep_extreme+InpStopPadATR15*g_atr15_last;
+      if(sl-entry<=0 || sl-entry>InpMaxStopATR*g_atr_daily) return;
+      tp=entry-InpTargetR*(sl-entry);
+     }
+
+   double risk_money=AccountInfoDouble(ACCOUNT_BALANCE)*(InpRiskPct/100.0);
+   double one_lot_loss=0;
+   ENUM_ORDER_TYPE typ=(g_color==COLOR_GREEN ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+   if(!OrderCalcProfit(typ,g_gold,1.0,entry,sl,one_lot_loss)) return;
+   one_lot_loss=MathAbs(one_lot_loss);
+   if(one_lot_loss<=0) return;
+   double vol=risk_money/one_lot_loss;
+   double vmin=SymbolInfoDouble(g_gold,SYMBOL_VOLUME_MIN);
+   double vmax=SymbolInfoDouble(g_gold,SYMBOL_VOLUME_MAX);
+   double vstep=SymbolInfoDouble(g_gold,SYMBOL_VOLUME_STEP);
+   if(vstep<=0) return;
+   vol=MathFloor(vol/vstep)*vstep;
+   vol=MathMin(vol,vmax);
+   if(vol<vmin)
+     {
+      Notify("Semaforo: senal descartada; volumen calculado bajo minimo del broker.");
+      return;
+     }
+
+   int digits=(int)SymbolInfoInteger(g_gold,SYMBOL_DIGITS);
+   sl=NormalizeDouble(sl,digits); tp=NormalizeDouble(tp,digits); vol=NormalizeDouble(vol,8);
+   string side=(g_color==COLOR_GREEN?"COMPRA":"VENTA");
+   string msg=StringFormat("SEÑAL %s %s | entrada~%s SL %s TP~%s | vol %.4f | riesgo %.2f%%",
+                  side,g_gold,DoubleToString(entry,digits),DoubleToString(sl,digits),DoubleToString(tp,digits),vol,InpRiskPct);
+   Notify(msg);
+
+   if(!InpExecuteDemoOrders) return;
+   if((ENUM_ACCOUNT_TRADE_MODE)AccountInfoInteger(ACCOUNT_TRADE_MODE)==ACCOUNT_TRADE_MODE_REAL)
+     {
+      Print("BLOQUEADO: cuenta REAL.");
+      return;
+     }
+
+   bool ok=false;
+   if(g_color==COLOR_GREEN) ok=trade.Buy(vol,g_gold,0.0,sl,tp,"Semaforo v0.2.1");
+   else ok=trade.Sell(vol,g_gold,0.0,sl,tp,"Semaforo v0.2.1");
+   if(!ok)
+     {
+      PrintFormat("Orden rechazada. retcode=%u %s",trade.ResultRetcode(),trade.ResultRetcodeDescription());
+      return; // no retry
+     }
+
+   // Recalcular TP con precio real de ejecucion; stop no se mueve.
+   ulong pos_ticket=0;
+   if(FindOurPosition(pos_ticket))
+     {
+      double real_entry=PositionGetDouble(POSITION_PRICE_OPEN);
+      double real_tp=(g_color==COLOR_GREEN ? real_entry+InpTargetR*(real_entry-sl) : real_entry-InpTargetR*(sl-real_entry));
+      real_tp=NormalizeDouble(real_tp,digits);
+      if(!trade.PositionModify(pos_ticket,sl,real_tp))
+        {
+         Print("No se pudo reajustar TP al fill real. Cierre fail-closed.");
+         trade.PositionClose(pos_ticket);
+        }
+     }
+  }
+
+void ProcessBar(datetime bar_start_ny,bool allow_entry)
+  {
+   if(!g_prepared || g_color==COLOR_AMBER || g_day_blocked) return;
+   datetime session_start=NYAt(g_trading_date,2,0);
+   datetime session_end=NYAt(g_trading_date,11,0);
+   if(bar_start_ny<session_start || bar_start_ny>=session_end) return;
+   RangeBar b={};
+   if(!Build15Bar(bar_start_ny,b))
+     {
+      g_day_blocked=true;
+      Print("Hueco de datos en ventana de entrada: se cancelan entradas restantes.");
+      return;
+     }
+
+   for(int i=0;i<g_level_count;i++)
+     {
+      if(!g_levels[i].enabled || g_levels[i].consumed) continue;
+      double L=g_levels[i].level;
+      bool perforates=false, recovers=false, breaks=false;
+      if(g_color==COLOR_GREEN)
+        {
+         perforates=(b.low<=L-InpMinSweepATR*g_atr_daily);
+         breaks=(b.low<L-InpMaxSweepATR*g_atr_daily);
+         recovers=(b.close>L);
+        }
+      else
+        {
+         perforates=(b.high>=L+InpMinSweepATR*g_atr_daily);
+         breaks=(b.high>L+InpMaxSweepATR*g_atr_daily);
+         recovers=(b.close<L);
+        }
+
+      if(!g_levels[i].active && perforates)
+        {
+         g_levels[i].active=true;
+         g_levels[i].bars_seen=0;
+         g_levels[i].extreme=(g_color==COLOR_GREEN?b.low:b.high);
+        }
+      if(g_levels[i].active)
+        {
+         if(g_color==COLOR_GREEN) g_levels[i].extreme=MathMin(g_levels[i].extreme,b.low);
+         else g_levels[i].extreme=MathMax(g_levels[i].extreme,b.high);
+
+         if(breaks)
+           {
+            g_levels[i].active=false; g_levels[i].consumed=true;
+            continue;
+           }
+         // misma vela o una de las 4 siguientes
+         if(recovers && g_levels[i].bars_seen<=InpRecoveryBars)
+           {
+            double ext=g_levels[i].extreme;
+            g_levels[i].active=false; g_levels[i].consumed=true;
+            if(allow_entry) ExecuteSignal(i,ext,bar_start_ny);
+            continue;
+           }
+         g_levels[i].bars_seen++;
+         if(g_levels[i].bars_seen>InpRecoveryBars)
+           {
+            g_levels[i].active=false; g_levels[i].consumed=true;
+           }
+        }
+     }
+  }
+
+void ReconstructAndProcess(datetime now_ny,bool allow_live_entry)
+  {
+   datetime last_complete=Floor15(now_ny)-15*60;
+   while(g_last_processed_bar_ny<last_complete)
+     {
+      datetime next=g_last_processed_bar_ny+15*60;
+      bool live=(allow_live_entry && next==last_complete); // solo en funcionamiento continuo
+      ProcessBar(next,live);
+      g_last_processed_bar_ny=next;
+     }
+  }
+
+//---------------------------- salidas -------------------------------
+void ManageTimeExit(datetime now_ny)
+  {
+   ulong pos_ticket=0;
+   if(!FindOurPosition(pos_ticket)) return;
+   if(g_data_day && now_ny>=NYAt(g_trading_date,8,20) && now_ny<NYAt(g_trading_date,9,0))
+     {
+      trade.PositionClose(pos_ticket);
+      Notify("Semaforo: cierre preventivo 08:20 NY por dia de dato.");
+      return;
+     }
+   if(now_ny>=NYAt(g_trading_date,15,0))
+     {
+      trade.Posit
