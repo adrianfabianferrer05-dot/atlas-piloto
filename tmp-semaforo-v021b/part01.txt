@@ -1,0 +1,192 @@
+//+------------------------------------------------------------------+
+//| Semaforo_XAUUSD_MT5_v021b.mq5                                    |
+//| Port operativo de Estrategia Semaforo v0.2.1 para MetaTrader 5  |
+//| DEMO ONLY. No usar como prueba oficial de rentabilidad.          |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "0.212"
+#property description "Estrategia Semaforo v0.2.1 XAUUSD - DEMO only"
+#property description "Calcula sesgo diario, detecta barrido/recuperacion, envia push y opcionalmente ejecuta en DEMO."
+
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+enum OverrideMode
+  {
+   AUTO_DETECT=0,
+   FORCE_NO=1,
+   FORCE_YES=2
+  };
+
+enum SignalColor
+  {
+   COLOR_AMBER=0,
+   COLOR_GREEN=1,
+   COLOR_RED=2
+  };
+
+input group "--- Seguridad / ejecucion ---"
+input bool   InpExecuteDemoOrders=false;     // false = solo senales
+input bool   InpPushNotifications=true;
+input ulong  InpMagic=20261005021;
+input double InpRiskPct=0.50;
+input double InpDailyLossPct=1.00;
+input double InpWeeklyLossPct=2.00;
+input double InpMaxDrawdownPct=8.00;
+input int    InpMaxTradesPerDay=2;
+input int    InpDeviationPoints=50;
+input bool   InpHumanResetKill=false;       // true una vez para rearmar tras revision humana
+
+input group "--- Simbolos del broker ---"
+input string InpGoldSymbol="";              // vacio = simbolo del grafico
+input string InpEURUSD="EURUSD";
+input string InpUSDJPY="USDJPY";
+input string InpGBPUSD="GBPUSD";
+input string InpUSDCAD="USDCAD";
+input string InpUSDSEK="USDSEK";
+input string InpUSDCHF="USDCHF";
+
+input group "--- Macro ---"
+input bool   InpUseFRED=true;
+input string InpFredUrl="https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFII10";
+input bool   InpUseManualTips=false;
+input double InpManualTipsCurrent=0.0;
+input double InpManualTipsMA20=0.0;
+input OverrideMode InpDataDayOverride=AUTO_DETECT;
+input OverrideMode InpFedDayOverride=AUTO_DETECT;
+
+input group "--- Parametros v0.2.1 ---"
+input int    InpTrendMA=50;
+input int    InpTrendSlopeDays=10;
+input int    InpMacroMA=20;
+input int    InpATRDays=14;
+input double InpMinSweepATR=0.05;
+input double InpMaxSweepATR=0.50;
+input double InpStopPadATR15=0.10;
+input double InpMaxStopATR=0.35;
+input int    InpRecoveryBars=4;              // siguientes; total = misma + 4
+input double InpTargetR=2.0;
+input double InpMergeLevelsATR=0.10;
+
+struct RangeBar
+  {
+   bool valid;
+   double open;
+   double high;
+   double low;
+   double close;
+  };
+
+struct AttemptState
+  {
+   bool enabled;
+   bool active;
+   bool consumed;
+   int bars_seen;
+   double level;
+   double extreme;
+  };
+
+string       g_gold="";
+string       g_eurusd="",g_usdjpy="",g_gbpusd="",g_usdcad="",g_usdsek="",g_usdchf="";
+datetime     g_trading_date=0;        // fecha naive NY 00:00 del dia de cierre
+bool         g_prepared=false;
+bool         g_day_blocked=false;
+bool         g_calendar_ok=false;
+bool         g_killed=false;
+bool         g_data_day=false;
+bool         g_fed_day=false;
+SignalColor  g_color=COLOR_AMBER;
+double       g_atr_daily=0.0;
+double       g_atr15_last=0.0;
+AttemptState g_levels[2];
+int          g_level_count=0;
+datetime     g_last_processed_bar_ny=0;
+datetime     g_last_tick_utc=0;
+double       g_peak_equity=0.0;
+string       g_peak_key="";
+string       g_kill_key="";
+
+//----------------------- utilidades de tiempo -----------------------
+datetime MakeDT(int y,int m,int d,int hh=0,int mm=0,int ss=0)
+  {
+   MqlDateTime x={};
+   x.year=y; x.mon=m; x.day=d; x.hour=hh; x.min=mm; x.sec=ss;
+   return StructToTime(x);
+  }
+
+datetime DateOnly(datetime t)
+  {
+   MqlDateTime x={}; TimeToStruct(t,x);
+   return MakeDT(x.year,x.mon,x.day,0,0,0);
+  }
+
+int NthSunday(int year,int mon,int nth)
+  {
+   datetime first=MakeDT(year,mon,1,0,0,0);
+   MqlDateTime f={}; TimeToStruct(first,f);
+   int add=(7-f.day_of_week)%7;
+   return 1+add+7*(nth-1);
+  }
+
+bool IsNYDSTLocal(datetime ny)
+  {
+   MqlDateTime x={}; TimeToStruct(ny,x);
+   int march_sun=NthSunday(x.year,3,2);
+   int nov_sun=NthSunday(x.year,11,1);
+   datetime start=MakeDT(x.year,3,march_sun,2,0,0);
+   datetime end=MakeDT(x.year,11,nov_sun,2,0,0);
+   return (ny>=start && ny<end);
+  }
+
+bool IsNYDSTUtc(datetime utc)
+  {
+   MqlDateTime x={}; TimeToStruct(utc,x);
+   int march_sun=NthSunday(x.year,3,2);
+   int nov_sun=NthSunday(x.year,11,1);
+   datetime start_utc=MakeDT(x.year,3,march_sun,7,0,0); // 02:00 EST
+   datetime end_utc=MakeDT(x.year,11,nov_sun,6,0,0);   // 02:00 EDT
+   return (utc>=start_utc && utc<end_utc);
+  }
+
+datetime NYToUTC(datetime ny)
+  {
+   return ny + (IsNYDSTLocal(ny) ? 4*3600 : 5*3600);
+  }
+
+datetime UTCToNY(datetime utc)
+  {
+   return utc - (IsNYDSTUtc(utc) ? 4*3600 : 5*3600);
+  }
+
+datetime CurrentUTC()
+  {
+   MqlTick t={};
+   if(SymbolInfoTick(g_gold,t) && t.time>0) return t.time;
+   return TimeGMT();
+  }
+
+datetime TradingDateFromNY(datetime ny)
+  {
+   MqlDateTime x={}; TimeToStruct(ny,x);
+   datetime d=MakeDT(x.year,x.mon,x.day,0,0,0);
+   if(x.hour>=18) d+=86400;
+   return d;
+  }
+
+void TradingBoundsUTC(datetime trading_date,datetime &start_utc,datetime &end_utc)
+  {
+   MqlDateTime d={}; TimeToStruct(trading_date,d);
+   datetime start_ny=MakeDT(d.year,d.mon,d.day,18,0,0)-86400;
+   datetime end_ny=MakeDT(d.year,d.mon,d.day,17,0,0);
+   start_utc=NYToUTC(start_ny);
+   end_utc=NYToUTC(end_ny);
+  }
+
+datetime NYAt(datetime trading_date,int hh,int mm=0)
+  {
+   MqlDateTime d={}; TimeToStruct(trading_date,d);
+   return MakeDT(d.year,d.mon,d.day,hh,mm,0);
+  }
+
+dat
